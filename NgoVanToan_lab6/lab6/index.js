@@ -1,100 +1,182 @@
-require('dotenv').config(); 
-
-const express = require('express');
-const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, ScanCommand, PutCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
-const multer = require('multer');
-
+const express = require("express");
 const app = express();
-app.set('view engine', 'ejs');
-app.set('views', './views');
-app.use(express.static('views'));
+const post = 3000;
+const path = require("path");
+const AWS = require("aws-sdk");
+const multer = require("multer"); // middleware for handling multipart/form-data
+const { v4: uuid } = require("uuid"); // Import the uuid library for generating unique IDs
+
+
+app.use(express.json({ extended: false }));
+app.use(express.static(path.join(__dirname, "views")));
+app.set("view engine", "ejs");
+app.set("views", "./views");
+
 app.use(express.urlencoded({ extended: true }));
 
-// 🔥 Cấu hình AWS SDK v3 với biến môi trường
-const client = new DynamoDBClient({
-    region: process.env.AWS_REGION,
-    credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID, 
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
-    }
+require('dotenv').config(); // Load environment variables from .env file
+
+
+process.env.AWS_SDK_JS_SUPRESS_MAINTENANCE_MODE_MASSAGE = "1";
+
+AWS.config.update({
+    region: 'ap-southeast-1',
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+})
+const docClient = new AWS.DynamoDB.DocumentClient(); // Create a DynamoDB DocumentClient instance
+
+const s3 = new AWS.S3(); // Create an S3 instance
+
+
+const bucketName = process.env.BUCKET_NAME; // S3 bucket name
+//upload
+const tableName = 'sanpham'; // DynamoDB table name
+
+//cau hinh multer quan ly upload image
+const storage = multer.memoryStorage({
+  destination(req, file, callback) {
+    callback(null, ""); // set destination để lưu trữ file trong bộ nhớ tạm thời
+  },
 });
 
-const docClient = DynamoDBDocumentClient.from(client);
-const tableName = 'sanpham';
-const upload = multer();
-
-// Route lấy dữ liệu từ DynamoDB
-app.get('/', async (req, res) => {
-    try {
-        const command = new ScanCommand({ TableName: tableName });
-        const data = await docClient.send(command);
-        res.render('index', { sanPhams: data.Items || [] });
-    } catch (err) {
-        console.error('Lỗi:', err);
-        res.status(500).send('Internal Server Error');
-    }
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // Limit file size to 5MB
+  },
+  fileFilter(req, file, callback) { // kiểm tra loại file
+    checkFileType(file, callback);
+  },
 });
 
-// Thêm dữ liệu vào DynamoDB
-app.post("/", upload.none(), async (req, res) => { 
-    console.log("Dữ liệu nhận được:", req.body);
-    const { ma_sp, ten_sp, so_luong } = req.body;
+const CLOUD_FRONT_URL = 'https://d1mrfknlmvbwm.cloudfront.net'; // CloudFront URL for accessing S3 files
 
-    if (!ma_sp || !ten_sp || !so_luong) {
-        return res.status(400).send("Thiếu dữ liệu sản phẩm!");
+// kiểm tra loại file. 
+function checkFileType(file, cb) {
+  const fileTypes = /jpeg|jpg|png|gif/;
+  const extname = fileTypes.test(path.extname(file.originalname).toLowerCase());
+  const mimetype = fileTypes.test(file.mimetype);
+  if (extname && mimetype) {
+    return cb(null, true);
+  }
+  return cb("Error: Pls upload images /jpeg|jpg|png|gif/ only!");
+}
+
+app.get("/", (req, res) => {
+
+  const params = {
+    TableName: tableName,
+  };
+
+  docClient.scan(params, (err, data) => {
+    if (err) {
+      console.error("Error fetching data:", err);
+      res.status(500).send("Internal Server Error");
+    } else {
+      res.render("index", { sanPhams: data.Items });
     }
+  });
+});
 
-    const params = {
-        TableName: tableName,
-        Item: {
-            "ma_sp": ma_sp,
-            "ten_sp": ten_sp,
-            "so_luong": parseInt(so_luong, 10)
-        }
-    };
-
+//them
+app.post("/save", upload.single("hinh_anh"), async (req, res) => {
     try {
-        await docClient.send(new PutCommand(params));
-        console.log("Thêm dữ liệu thành công!");
-        return res.redirect("/");
+        const { ma_sp, ten_sp, so_luong } = req.body;
+
+        const image = req.file.originalname.split('.'); // lay ten file
+        const fileType = image[image.length - 1]; // lay phan mo rong
+        const filePath = `${uuid()}_${new Date().getTime()}.${fileType}`; // ten file moi
+
+        const paramsS3 = {
+            Bucket: bucketName,
+            Key: filePath,
+            Body: req.file.buffer, // Buffer data from multer
+            ContentType: req.file.mimetype // MIME type of the file
+        };
+s3.upload(paramsS3, (err, data) => {
+
+            if(err) {
+                console.error("Error uploading file to S3:", err);
+                return res.status(500).send("Internal Server Error");
+            } else {
+
+                // params để lưu trữ dữ liệu vào DynamoDB
+                const params = {
+                    TableName: tableName,
+                    Item: {
+                        ma_sp: ma_sp,
+                        ten_sp: ten_sp,
+                        so_luong: so_luong,
+                        hinh_anh: `${CLOUD_FRONT_URL}/${filePath}`, // URL của hình ảnh đã upload lên S3
+    
+                    },
+                };
+        
+                // thêm imageUrl vào params.Item
+        
+                // lưu dữ liệu vào DynamoDB
+                docClient.put(params, (err, data) => {
+                    if (err) {
+                        console.error("Error fetching data:", err);
+                        res.status(500).send("Internal Server Error");
+                    } else {
+                        res.redirect("/");
+                    }
+                });
+            }
+
+        });
+
     } catch (err) {
-        console.error("Lỗi khi thêm dữ liệu:", err);
+
         return res.status(500).send("Internal Server Error");
     }
+  
 });
 
-// Xóa dữ liệu
-app.post('/delete', upload.none(), async (req, res) => {
-    let listItems = req.body.ma_sp;
+//xóa
+app.post("/delete", upload.fields([]), (req, res) => {
+  const listItems = Object.keys(req.body); // lấy danh sách các key từ req.body
 
-    if (!listItems) {
-        return res.redirect("/");
-    }
+  console.log("listItems: ", listItems);
+  if (listItems.length === 0) {
+    console.log("Khong co san pham nao de xoa");
+    return res.redirect("/");
+  }
 
-    if (!Array.isArray(listItems)) {
-        listItems = [listItems];
-    }
+  // Gọi hàm đệ quy để xóa từng mục trong danh sách
+  function onDeleteItems(index) {
+    // du lieu can xoa
+    // listItems[index] là Id của sản phẩm cần xóa
+    const params = {
+      TableName: tableName,
+      Key: {
+        ma_sp: listItems[index],
+      },
+    };
 
-    try {
-        for (const id of listItems) {
-            const params = {
-                TableName: tableName,
-                Key: { ma_sp: id }
-            };
+    //
+    docClient.delete(params, (err, data) => {
+      if (err) {
+        console.error("Error fetching data:", err);
+      } else {
+        // Nếu còn phần tử nào trong danh sách, gọi đệ quy để xóa tiếp
+        // Nếu không còn phần tử nào, quay về trang chủ
+        if (index > 0) {
+          onDeleteItems(index - 1);
+        } else {
+          console.log("Da xoa xong");
 
-            await docClient.send(new DeleteCommand(params));
+          return res.redirect("/");
         }
+      }
+    });
+  }
 
-        res.redirect("/");
-    } catch (error) {
-        console.error("Delete Error:", error);
-        res.status(500).send('Internal Server Error');
-    }
+  onDeleteItems(listItems.length - 1); // Bắt đầu từ phần tử cuối cùng trong danh sách
 });
 
-// Khởi động server
-const PORT = 3000;
-app.listen(PORT, () => {
-    console.log(`🔥 Server chạy tại: http://localhost:${PORT}`);
+app.listen(post, () => {
+  console.log(`Server is running on http://localhost:${post}`);
 });
